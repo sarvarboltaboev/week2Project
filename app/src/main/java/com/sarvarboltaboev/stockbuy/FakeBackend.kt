@@ -1,83 +1,13 @@
 package com.sarvarboltaboev.stockbuy
 
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withContext
-import org.json.JSONObject
-import java.net.HttpURLConnection
-import java.net.URL
 import java.util.UUID
-
-/** Client side of BillingService. Flutter: FakeApi.billing (billing_client.g.dart). */
-interface FakeApi {
-    suspend fun createOrderV2(req: OrderRequest, idempotencyKey: String): OrderResponse
-    fun orderStatus(id: Long): Flow<OrderStatus>
-}
-
-/** Real backend. POST is sent once, never retried: a retry without server dedup = duplicate order. */
-class HttpFakeApi(private val rootUrl: String, private val token: String) : FakeApi {
-
-    override suspend fun createOrderV2(req: OrderRequest, idempotencyKey: String): OrderResponse =
-        withContext(Dispatchers.IO) {
-            val body = JSONObject()
-                .put("operation_id", req.operationId)
-                .put("currency_id", req.currencyId)
-                .put("amount", req.amount)
-                .put("current_price", req.currentPrice)
-                .put("instrument_id", req.instrumentId)
-                .put("customer_pocket_id", req.customerPocketId)
-                .put("type", req.type.wire)
-                .put("duration", req.duration.wire)
-                .put("allow_in_pre_post", req.allowInPrePost)
-            Tracer.log(Layer.HTTP, "POST $rootUrl/v2/orders Idempotency-Key=${idempotencyKey.take(8)}…")
-            val json = request("POST", "/v2/orders", idempotencyKey, body.toString())
-            OrderResponse(json.getString("id").toLong()) // proto int64 comes as a JSON string
-        }
-
-    // ponytail: polling every 3s; backend has no order-status stream, push notifications cover it in the real app
-    override fun orderStatus(id: Long): Flow<OrderStatus> = flow {
-        while (true) {
-            val json = withContext(Dispatchers.IO) { request("GET", "/v2/orders/$id", null, null) }
-            val status = OrderStatus.valueOf(json.optString("status", "pending").uppercase())
-            emit(status)
-            if (status != OrderStatus.PENDING && status != OrderStatus.PROCESSING) break
-            delay(3_000)
-        }
-    }
-
-    private fun request(method: String, path: String, idempotencyKey: String?, body: String?): JSONObject {
-        val conn = URL(rootUrl + path).openConnection() as HttpURLConnection
-        try {
-            conn.requestMethod = method
-            conn.connectTimeout = 30_000
-            conn.readTimeout = 30_000
-            conn.setRequestProperty("Authorization", "Bearer $token")
-            conn.setRequestProperty("Content-Type", "application/json")
-            // core_service ignores this today; it is what server-side dedup should key on
-            idempotencyKey?.let { conn.setRequestProperty("Idempotency-Key", it) }
-            if (body != null) {
-                conn.doOutput = true
-                conn.outputStream.use { it.write(body.toByteArray()) }
-            }
-            val code = conn.responseCode
-            val text = (if (code in 200..299) conn.inputStream else conn.errorStream)
-                ?.bufferedReader()?.use { it.readText() }.orEmpty()
-            Tracer.log(Layer.HTTP, "$method $path → $code")
-            val json = if (text.isBlank()) JSONObject() else JSONObject(text)
-            if (code !in 200..299) throw ApiException(code.toString(), json.optString("message", "HTTP $code"))
-            return json
-        } finally {
-            conn.disconnect()
-        }
-    }
-}
 
 /**
  * In-process copy of core_service's buy path, so the whole trace runs without a server.
@@ -88,7 +18,7 @@ class FakeBackend(
     var balance: Double = 1_000.0,
     var marketOpen: Boolean = true,
     private val stepDelayMs: Long = 600,
-) : FakeApi {
+) {
 
     private var held = 0.0 // pending ledger rows (the "hold")
     private var nextId = 101L
@@ -99,7 +29,7 @@ class FakeBackend(
     // balance check has (READ COMMITTED, no lock). Real fix there: SELECT ... FOR UPDATE per customer.
     private val txLock = Mutex()
 
-    override suspend fun createOrderV2(req: OrderRequest, idempotencyKey: String): OrderResponse {
+    suspend fun createOrderV2(req: OrderRequest, idempotencyKey: String): OrderResponse {
         Tracer.log(Layer.HTTP, "POST /v2/orders Idempotency-Key=${idempotencyKey.take(8)}…")
         step()
 
@@ -157,7 +87,7 @@ class FakeBackend(
         }
     }
 
-    override fun orderStatus(id: Long): Flow<OrderStatus> =
+    fun orderStatus(id: Long): Flow<OrderStatus> =
         statuses[id] ?: throw ApiException("NOT_FOUND", "order $id")
 
     /** transport/workers/background: what asynq does after the HTTP call already returned. */
