@@ -2,6 +2,8 @@
 
 Native Android rebuild of a stock-buy flow, with a live trace of every hop.
 
+[![Demo](docs/demo.gif)](docs/demo.mp4)
+
 Screens: stock detail → buy form → confirm → order placed (live status).
 Bottom panel and `adb logcat -s BuyTrace` show the path:
 
